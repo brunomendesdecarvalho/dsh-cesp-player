@@ -9,7 +9,7 @@ A [Cordis](https://github.com/deepseek-ai/deepseek-harness) plugin for **DeepSee
 
 ## Features
 
-- Maps real Harness events to CESP categories.
+- Maps real Harness events to CESP categories, including `resource.limit` for rate/quota/token limits.
 - Loads and validates the active pack once during `apply`.
 - Honors `mute`, `volume`, and `enabledCategories`.
 - 500 ms debounce per category and no-repeat selection.
@@ -52,9 +52,14 @@ Override the installed row in your profile's `cordis.patch.yml`:
   name: '@local/cesp-player'
   config:
     packsDir: '~/.claude/hooks/peon-ping/packs'
-    activePack: peon
+    activePack: sc_scv
     volume: 0.5
     mute: false
+```
+
+`task.acknowledge` is enabled by default. To silence only that category:
+
+```yaml
     enabledCategories:
       task.acknowledge: false
 ```
@@ -82,13 +87,15 @@ PeonPing installs packs under:
 └── glados/
 ```
 
-Each pack contains `openpeon.json` and `sounds/`. For the `peon` pack:
+Each pack contains `openpeon.json` and `sounds/`. Typical configuration:
 
 ```yaml
 config:
   packsDir: '~/.claude/hooks/peon-ping/packs'
-  activePack: peon
+  activePack: sc_scv
 ```
+
+Available packs: `peon`, `peasant`, `sc_scv`, `sc_battlecruiser`, and `glados`. The `peon` pack uses generic lines in `task.complete` (e.g. “Ready to work?”), which can sound like task start; use `sc_scv` (“Job's finished”) or `glados` (“Good news”) for clearer completion cues. This is pack content, not the plugin's mapping.
 
 ## Manifest
 
@@ -97,11 +104,13 @@ CESP 1.0 packs use:
 ```json
 {
   "cesp_version": "1.0",
-  "name": "peon",
+  "name": "my-pack",
+  "display_name": "My Sound Pack",
+  "version": "1.0.0",
   "categories": {
     "task.complete": {
       "sounds": [
-        { "file": "sounds/PeonReady1.wav", "label": "Ready to work?" }
+        { "file": "sounds/complete.wav", "label": "Done" }
       ]
     }
   }
@@ -122,7 +131,8 @@ Path rules:
 
 - `file` is relative to the manifest and uses `/`.
 - Without `/`, the plugin prefixes `sounds/`.
-- Missing files are dropped at load with a warning.
+- Absolute paths, `../`, and paths outside the pack root are rejected.
+- File names must match `[a-zA-Z0-9._-]+`.
 
 Optional aliases:
 
@@ -134,6 +144,19 @@ Optional aliases:
 }
 ```
 
+## CESP 1.0 compliance
+
+At load, the player validates:
+
+- `cesp_version` 1.x (a different major disables the pack);
+- `categories` as an object, each category as `{ "sounds": [...] }` (the legacy array form is also accepted);
+- relative paths, no `../`, no backslashes, and inside the pack root;
+- `.wav`, `.mp3`, and `.ogg` extensions with matching magic bytes (`RIFF/WAVE`, `ID3`/MP3 frame, `OggS`);
+- 1 MB per file and a warning when the total exceeds 50 MB;
+- a present `label` (warning when missing).
+
+Core categories supported: `session.start`, `task.acknowledge`, `task.complete`, `task.error`, `input.required`, and `resource.limit`. Extended categories `user.spam`, `session.end`, and `task.progress` are optional in the spec and are not mapped.
+
 ## Event mapping
 
 Cordis does not expose `session/start`, `turn/start`, `turn/end`, or `tool/call` as Cordis events. Turn events are durable `session/event` variants; “waiting for input” is represented by the explicit approval/question events.
@@ -141,13 +164,19 @@ Cordis does not expose `session/start`, `turn/start`, `turn/end`, or `tool/call`
 | Real Harness event | CESP category | Notes |
 |---|---|---|
 | `agent/created` | `session.start` | Closest equivalent to `session/start`. |
-| `session/event` with `turn/start` | `task.acknowledge` | Optional; disable it if noisy. |
-| `session/event` with `turn/end` and `reason.kind === 'completed'` | `task.complete` | Clean completion only. |
-| `agent/error` | `task.error` | Step/turn errors. |
-| `approval/request` | `input.required` | Waterfall: the listener calls `next()`. |
-| `user-questions/request` | `input.required` | Waterfall: same. |
+| `session/event` with `turn/start` | `task.acknowledge` | Enabled by default; can be disabled. |
+| `session/event` with `turn/end` and `reason.kind === 'completed'` | `task.complete` | Clean completion. |
+| `session/event` with `turn/end` and `reason.kind === 'max-tokens'` | `resource.limit` | Token/context limit. |
+| `session/event` with `approval/asked` | `input.required` | Durable path; always reaches the plugin. |
+| `session/event` with `tool/call` and `name === 'ask_user_question'` | `input.required` | Durable path for user questions. |
+| `agent/error` with `RATE_LIMIT`, `QUOTA`, `ACCOUNT_QUOTA`, or `CONTEXT_WINDOW_EXCEEDED` | `resource.limit` | Resource limit, not a generic failure. |
+| `agent/error` (other errors) | `task.error` | Step/turn errors. |
+| `approval/request` | `input.required` | Waterfall; best-effort when the scope delivers it to the root. |
+| `user-questions/request` | `input.required` | Waterfall; same. |
 
-`turn/end` with `aborted`, `blocked`, `max-tokens`, `interrupted`, or `forked` stays silent.
+`turn/end` with `aborted`, `blocked`, `interrupted`, or `forked` stays silent. `turn/end` with `error` leaves `task.error`/`resource.limit` to `agent/error`, avoiding a duplicate sound.
+
+**Event scope:** `approval/request` and `user-questions/request` are waterfalls dispatched in the agent scope and may not reach a plugin mounted at the root. The primary `input.required` path is therefore the durable `approval/asked` and `tool/call` events; the waterfalls are a best-effort reinforcement, registered with `{ global: true }` and forwarding `next()`.
 
 ## Audio backends
 
@@ -170,7 +199,7 @@ pnpm build
 pnpm test
 ```
 
-The suite covers manifests, aliases, debounce, no-repeat, mute, disabled categories, `sounds/` paths, CESP 1.0, the array legacy form, and a real Cordis `Context` integration.
+The suite covers manifests, aliases, debounce, no-repeat, mute, disabled categories, `sounds/` paths, CESP 1.0, the array legacy form, path traversal, magic bytes, size limits, `resource.limit` mapping, and a real Cordis `Context` integration.
 
 ## Troubleshooting
 
@@ -189,14 +218,20 @@ Then toggle the plugin off/on in **Plugins**.
 
 1. Check `packsDir` and `activePack`.
 2. Test the file directly: `pw-play ~/.claude/hooks/peon-ping/packs/peon/sounds/PeonReady1.wav`.
-3. Look for `[cesp-player] pacote "peon" carregado...` in the logs.
+3. Look for `[cesp-player] pacote "..." carregado...` in the logs.
 4. Toggle the plugin after adding files.
+
+**A “task start” line plays at the end**
+
+- Check that `task.acknowledge` is not disabled.
+- The `peon` pack uses generic lines in `task.complete` (“Ready to work?”). Switch to `sc_scv` or `glados` for explicit completion cues. This is pack content, not the plugin's mapping.
 
 ## Limitations
 
 - Linux only.
 - The manifest is read at load; changes require a plugin reload.
 - Subagent sessions also emit events; the plugin does not filter them.
+- Extended categories (`user.spam`, `session.end`, `task.progress`) are not mapped; they are optional in CESP 1.0.
 - `aplay` ignores volume.
 - With no audio backend on `PATH`, sounds are disabled with a single warning.
 

@@ -8,17 +8,20 @@
  *
  * Mapeamento usado (eventos reais do Harness, inspecionados na versão 0.2.2):
  *   agent/created            -> session.start       (equivalente a session/start)
- *   session/event turn/start -> task.acknowledge    (opcional)
- *   session/event turn/end   -> task.complete       (somente reason.kind === 'completed')
- *   agent/error              -> task.error
- *   approval/request         -> input.required      (waterfall: repassa next())
- *   user-questions/request   -> input.required      (waterfall: repassa next())
+ *   session/event turn/start -> task.acknowledge    (habilitada por padrão)
+ *   session/event turn/end   -> task.complete       (reason.kind === 'completed')
+ *   session/event turn/end   -> resource.limit      (reason.kind === 'max-tokens')
+ *   agent/error              -> task.error / resource.limit (por código)
+ *   session/event approval/asked -> input.required  (evento durável, sempre chega)
+ *   session/event tool/call ask_user_question -> input.required
+ *   approval/request         -> input.required      (waterfall, best-effort)
+ *   user-questions/request   -> input.required      (waterfall, best-effort)
  *
  * O catálogo do Cordis não expõe `session/start`, `turn/start`, `turn/end` nem
- * `tool/call` como eventos Cordis; `turn/*` e `tool/call` são variantes do
- * evento durável `session/event`, e "aguardando input" é representado pelos
- * eventos explícitos de aprovação/pergunta. Por isso o mapeamento acima difere
- * ligeiramente da tabela nominal, sem perder o significado CESP.
+ * `tool/call` como eventos Cordis; `turn/*`, `tool/call` e os eventos de
+ * aprovação são variantes do evento durável `session/event`. O plugin usa
+ * esses eventos duráveis como caminho principal; os waterfalls de aprovação e
+ * pergunta são um reforço para quando o escopo os entrega à raiz.
  */
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';

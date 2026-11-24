@@ -13,12 +13,30 @@ after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true })
 })
 
+/** Cria bytes minimamente válidos para os magic bytes exigidos pela CESP. */
+function writeValidSound(path, extension = '.ogg') {
+  if (extension === '.wav') {
+    writeFileSync(
+      path,
+      Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(16)]),
+    )
+    return
+  }
+  if (extension === '.mp3') {
+    writeFileSync(path, Buffer.concat([Buffer.from('ID3'), Buffer.alloc(16)]))
+    return
+  }
+  writeFileSync(path, Buffer.concat([Buffer.from('OggS'), Buffer.alloc(16)]))
+}
+
 function makePack(manifest, files = ['a.ogg', 'b.ogg', 'c.ogg']) {
   const root = mkdtempSync(join(tmpdir(), 'cesp-player-test-'))
   roots.push(root)
   const packDir = join(root, 'peon')
   mkdirSync(join(packDir, 'sounds'), { recursive: true })
-  for (const file of files) writeFileSync(join(packDir, 'sounds', file), '')
+  for (const file of files) {
+    writeValidSound(join(packDir, 'sounds', file), file.slice(file.lastIndexOf('.')))
+  }
   writeFileSync(join(packDir, 'openpeon.json'), JSON.stringify(manifest))
   return root
 }
@@ -26,6 +44,10 @@ function makePack(manifest, files = ['a.ogg', 'b.ogg', 'c.ogg']) {
 function defaultManifest() {
   // Formato CESP 1.0 real (como os packs do PeonPing/Cursor): { sounds: [...] }.
   return {
+    cesp_version: '1.0',
+    name: 'peon',
+    display_name: 'Peon',
+    version: '1.0.0',
     categories: {
       'task.complete': {
         sounds: [
@@ -200,6 +222,138 @@ describe('CespPlayer', () => {
     assert.match(player.status.reason ?? '', /openpeon\.json/)
     assert.equal(player.play('task.complete'), false)
     assert.equal(warnings.length, 1)
+  })
+})
+
+describe('CESP 1.0 compliance', () => {
+  function singleSoundManifest(file, extra = {}) {
+    return {
+      ...defaultManifest(),
+      categories: {
+        'task.complete': { sounds: [{ file, label: 'Test' }] },
+      },
+      ...extra,
+    }
+  }
+
+  it('rejeita path traversal (../) exigido pela Seção 3.1', () => {
+    const root = makePack(singleSoundManifest('../outside.ogg'))
+    const { player, warnings } = makePlayer(root)
+
+    assert.equal(player.status.ready, false)
+    assert.equal(
+      warnings.some((warning) => warning.includes('caminho de som inválido')),
+      true,
+    )
+  })
+
+  it('rejeita caminho absoluto', () => {
+    const root = makePack(singleSoundManifest('/tmp/outside.ogg'))
+    const { player, warnings } = makePlayer(root)
+
+    assert.equal(player.status.ready, false)
+    assert.equal(
+      warnings.some((warning) => warning.includes('caminho de som inválido')),
+      true,
+    )
+  })
+
+  it('rejeita magic bytes que não correspondem à extensão', () => {
+    const root = makePack(singleSoundManifest('bad.ogg'), ['bad.ogg'])
+    writeFileSync(join(root, 'peon', 'sounds', 'bad.ogg'), Buffer.from('not an audio file'))
+
+    const { player, warnings } = makePlayer(root)
+    assert.equal(player.status.ready, false)
+    assert.equal(
+      warnings.some((warning) => warning.includes('magic bytes')),
+      true,
+    )
+  })
+
+  it('rejeita áudio acima de 1 MB', () => {
+    const root = makePack(singleSoundManifest('big.ogg'), ['big.ogg'])
+    writeFileSync(
+      join(root, 'peon', 'sounds', 'big.ogg'),
+      Buffer.concat([Buffer.from('OggS'), Buffer.alloc(1024 * 1024)]),
+    )
+
+    const { player, warnings } = makePlayer(root)
+    assert.equal(player.status.ready, false)
+    assert.equal(
+      warnings.some((warning) => warning.includes('excede o limite de 1 MB')),
+      true,
+    )
+  })
+
+  it('rejeita formato fora de WAV/MP3/OGG', () => {
+    const root = makePack(singleSoundManifest('a.flac'), ['a.flac'])
+    const { player, warnings } = makePlayer(root)
+
+    assert.equal(player.status.ready, false)
+    assert.equal(
+      warnings.some((warning) => warning.includes('não é WAV, MP3 nem OGG')),
+      true,
+    )
+  })
+
+  it('aceita WAV e MP3 com headers válidos', () => {
+    for (const [file, bytes] of [
+      [
+        'a.wav',
+        Buffer.concat([
+          Buffer.from('RIFF'),
+          Buffer.alloc(4),
+          Buffer.from('WAVE'),
+          Buffer.alloc(16),
+        ]),
+      ],
+      ['a.mp3', Buffer.concat([Buffer.from('ID3'), Buffer.alloc(16)])],
+    ]) {
+      const root = makePack(singleSoundManifest(file), [file])
+      writeFileSync(join(root, 'peon', 'sounds', file), bytes)
+      const { player, played } = makePlayer(root, { random: () => 0 })
+      assert.equal(player.status.ready, true)
+      assert.equal(player.play('task.complete'), true)
+      assert.equal(played.length, 1)
+    }
+  })
+
+  it('desativa pack com major de CESP incompatível', () => {
+    const root = makePack(singleSoundManifest('a.ogg', { cesp_version: '2.0' }))
+    const { player, warnings } = makePlayer(root)
+
+    assert.equal(player.status.ready, false)
+    assert.match(player.status.reason ?? '', /CESP 2\.0 incompatível/)
+    assert.equal(
+      warnings.some((warning) => warning.includes('CESP 2.0 incompatível')),
+      true,
+    )
+  })
+
+  it('aceita pack antigo sem cesp_version, mas avisa', () => {
+    const { cesp_version: _ignored, ...legacy } = defaultManifest()
+    const root = makePack(legacy)
+    const { player, warnings } = makePlayer(root)
+
+    assert.equal(player.status.ready, true)
+    assert.equal(
+      warnings.some((warning) => warning.includes('sem "cesp_version"')),
+      true,
+    )
+  })
+
+  it('avisa quando o som não tem label, mas ainda carrega', () => {
+    const root = makePack({
+      ...defaultManifest(),
+      categories: { 'task.complete': { sounds: [{ file: 'a.ogg' }] } },
+    })
+    const { player, warnings } = makePlayer(root)
+
+    assert.equal(player.status.ready, true)
+    assert.equal(
+      warnings.some((warning) => warning.includes('sem "label"')),
+      true,
+    )
   })
 })
 

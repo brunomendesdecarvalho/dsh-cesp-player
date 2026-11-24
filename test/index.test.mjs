@@ -18,15 +18,23 @@ function makePack() {
   roots.push(root)
   const pack = join(root, 'peon')
   mkdirSync(join(pack, 'sounds'), { recursive: true })
-  writeFileSync(join(pack, 'sounds', 'a.ogg'), '')
+  writeFileSync(
+    join(pack, 'sounds', 'a.ogg'),
+    Buffer.concat([Buffer.from('OggS'), Buffer.alloc(16)]),
+  )
   writeFileSync(
     join(pack, 'openpeon.json'),
     JSON.stringify({
+      cesp_version: '1.0',
+      name: 'peon',
+      display_name: 'Peon',
+      version: '1.0.0',
       categories: {
-        'task.complete': { sounds: [{ file: 'a.ogg' }] },
-        'task.error': { sounds: [{ file: 'a.ogg' }] },
-        'input.required': { sounds: [{ file: 'a.ogg' }] },
-        'session.start': { sounds: [{ file: 'a.ogg' }] },
+        'task.complete': { sounds: [{ file: 'a.ogg', label: 'A' }] },
+        'task.error': { sounds: [{ file: 'a.ogg', label: 'A' }] },
+        'resource.limit': { sounds: [{ file: 'a.ogg', label: 'A' }] },
+        'input.required': { sounds: [{ file: 'a.ogg', label: 'A' }] },
+        'session.start': { sounds: [{ file: 'a.ogg', label: 'A' }] },
       },
       category_aliases: {},
     }),
@@ -53,7 +61,17 @@ describe('plugin apply no Cordis', () => {
       type: 'turn/end',
       data: { turn: 1, reason: { kind: 'aborted' } },
     })
+    ctx.emit('session/event', {}, {
+      type: 'turn/end',
+      data: { turn: 1, reason: { kind: 'max-tokens' } },
+    })
     ctx.emit('agent/error', { error: new Error('boom') })
+    ctx.emit('agent/error', { error: { code: 'RATE_LIMIT' } })
+    ctx.emit('session/event', {}, { type: 'approval/asked', data: {} })
+    ctx.emit('session/event', {}, {
+      type: 'tool/call',
+      data: { name: 'ask_user_question' },
+    })
 
     let nextCalls = 0
     const outcome = await ctx.waterfall('approval/request', {}, async () => {

@@ -76,6 +76,11 @@ export declare class CespPlayer {
     play(category: string): boolean;
     private loadPack;
     private parseSound;
+    /**
+     * Valida formato/tamanho/magic bytes do arquivo (CESP 1.0, Seções 4.1–4.4).
+     * Retorna o tamanho em bytes quando o arquivo é aceitável.
+     */
+    private validateAudioFile;
     private resolveCategory;
     private pickSound;
     private disable;

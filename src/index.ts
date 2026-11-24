@@ -8,23 +8,27 @@
  *
  * Mapeamento usado (eventos reais do Harness, inspecionados na versão 0.2.2):
  *   agent/created            -> session.start       (equivalente a session/start)
- *   session/event turn/start -> task.acknowledge    (opcional)
- *   session/event turn/end   -> task.complete       (somente reason.kind === 'completed')
- *   agent/error              -> task.error
- *   approval/request         -> input.required      (waterfall: repassa next())
- *   user-questions/request   -> input.required      (waterfall: repassa next())
+ *   session/event turn/start -> task.acknowledge    (habilitada por padrão)
+ *   session/event turn/end   -> task.complete       (reason.kind === 'completed')
+ *   session/event turn/end   -> resource.limit      (reason.kind === 'max-tokens')
+ *   agent/error              -> task.error / resource.limit (por código)
+ *   session/event approval/asked -> input.required  (evento durável, sempre chega)
+ *   session/event tool/call ask_user_question -> input.required
+ *   approval/request         -> input.required      (waterfall, best-effort)
+ *   user-questions/request   -> input.required      (waterfall, best-effort)
  *
  * O catálogo do Cordis não expõe `session/start`, `turn/start`, `turn/end` nem
- * `tool/call` como eventos Cordis; `turn/*` e `tool/call` são variantes do
- * evento durável `session/event`, e "aguardando input" é representado pelos
- * eventos explícitos de aprovação/pergunta. Por isso o mapeamento acima difere
- * ligeiramente da tabela nominal, sem perder o significado CESP.
+ * `tool/call` como eventos Cordis; `turn/*`, `tool/call` e os eventos de
+ * aprovação são variantes do evento durável `session/event`. O plugin usa
+ * esses eventos duráveis como caminho principal; os waterfalls de aprovação e
+ * pergunta são um reforço para quando o escopo os entrega à raiz.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { AudioPlayer } from './audio-player.js'
 import { CespPlayer, type CespLogger } from './cesp-player.js'
+import { categoryForAgentError, categoryForTurnEnd, isAskUserQuestionTool } from './event-map.js'
 
 export const name = 'cesp-player'
 
@@ -67,6 +71,7 @@ const DEFAULT_VOLUME = 0.5
 interface SessionEventLike {
   readonly type?: string
   readonly data?: {
+    readonly name?: string
     readonly reason?: {
       readonly kind?: string
     }
@@ -91,6 +96,7 @@ interface HarnessEventContext {
   on<K extends keyof HarnessEventMap>(
     name: K,
     listener: HarnessEventMap[K],
+    options?: { global?: boolean },
   ): () => boolean
 }
 
@@ -140,6 +146,9 @@ export function apply(ctx: Context, rawConfig?: Config): void {
       sink: audio,
       logger,
     })
+    const play = (category: string): void => {
+      player.play(category)
+    }
 
     // Recursos externos ao Cordis (processos de áudio) precisam de limpeza
     // explícita no unload/HMR. Os listeners de `ctx.on` já são efeitos.
@@ -159,37 +168,50 @@ export function apply(ctx: Context, rawConfig?: Config): void {
     const events = ctx as unknown as HarnessEventContext
 
     events.on('agent/created', () => {
-      player.play('session.start')
-    })
+      play('session.start')
+    }, { global: true })
 
-    events.on('agent/error', () => {
-      player.play('task.error')
-    })
+    events.on('agent/error', (payload) => {
+      // Rate limit/quota/contexto -> resource.limit; demais falhas -> task.error.
+      play(categoryForAgentError(payload.error))
+    }, { global: true })
 
     events.on('session/event', (_session, event) => {
       if (event.type === 'turn/start') {
-        // Opcional na tabela CESP; pode ser desligado em enabledCategories.
-        player.play('task.acknowledge')
+        // Categoria core de "aceitou o trabalho"; habilitada por padrão.
+        play('task.acknowledge')
         return
       }
-      if (event.type === 'turn/end' && event.data?.reason?.kind === 'completed') {
-        // Erros são tratados por agent/error; aqui só há conclusão limpa.
-        player.play('task.complete')
+      if (event.type === 'turn/end') {
+        const category = categoryForTurnEnd(event.data?.reason)
+        if (category !== null) play(category)
+        return
       }
-    })
+      // Fallback durável para o pedido de input: o serviço de perguntas roda
+      // em um escopo de agente separado, então o waterfall pode não chegar ao
+      // plugin de raiz. Estes eventos chegam sempre em `session/event`.
+      if (event.type === 'approval/asked') {
+        play('input.required')
+        return
+      }
+      if (event.type === 'tool/call' && isAskUserQuestionTool(event.data?.name)) {
+        play('input.required')
+      }
+    }, { global: true })
 
     // ATENÇÃO: approval/request e user-questions/request são eventos
-    // "waterfall". Chamar next() é obrigatório para não vetar a aprovação ou
-    // a pergunta; o play é fire-and-forget e não atrasa a cadeia.
+    // "waterfall" e são despachados com escopo de agente. `global: true` é
+    // necessário para um plugin de raiz recebê-los; chamar next() é
+    // obrigatório para não vetar a aprovação ou a pergunta.
     events.on('approval/request', (_request, next) => {
-      player.play('input.required')
+      play('input.required')
       return next()
-    })
+    }, { global: true })
 
     events.on('user-questions/request', (_request, next) => {
-      player.play('input.required')
+      play('input.required')
       return next()
-    })
+    }, { global: true })
   } catch (error) {
     logger.warn(
       `[cesp-player] falha ao inicializar; plugin permanece inativo: ${describeError(error)}`,

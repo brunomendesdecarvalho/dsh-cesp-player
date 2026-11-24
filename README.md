@@ -9,7 +9,7 @@ Plugin [Cordis](https://github.com/deepseek-ai/deepseek-harness) para o **DeepSe
 
 ## O que ele faz
 
-- Traduz eventos reais do Harness em categorias CESP.
+- Traduz eventos reais do Harness em categorias CESP, incluindo `resource.limit` para rate limit/quota/limite de tokens.
 - Lê o pacote ativo uma vez no `apply` e valida o manifesto.
 - Respeita `mute`, `volume` e `enabledCategories`.
 - Aplica debounce de 500 ms por categoria e evita repetir o último som.
@@ -56,14 +56,17 @@ O plugin aceita configuração pelo schema do Cordis. No `cordis.patch.yml` do s
   name: '@local/cesp-player'
   config:
     packsDir: '~/.claude/hooks/peon-ping/packs'
-    activePack: peon
+    activePack: sc_scv
     volume: 0.5
     mute: false
+```
+
+Também é possível editar os mesmos valores na tela de configuração do plugin, quando disponível. `task.acknowledge` vem habilitada por padrão; para silenciar só ela:
+
+```yaml
     enabledCategories:
       task.acknowledge: false
 ```
-
-Também é possível editar os mesmos valores na tela de configuração do plugin, quando disponível.
 
 #### Opções
 
@@ -90,13 +93,15 @@ O PeonPing instala os packs em:
 └── glados/
 ```
 
-Cada pack tem `openpeon.json` e `sounds/`. Uma configuração típica para usar o pack `peon`:
+Cada pack tem `openpeon.json` e `sounds/`. Uma configuração típica:
 
 ```yaml
 config:
   packsDir: '~/.claude/hooks/peon-ping/packs'
-  activePack: peon
+  activePack: sc_scv
 ```
+
+Packs disponíveis: `peon`, `peasant`, `sc_scv`, `sc_battlecruiser` e `glados`. O pack `peon` usa falas genéricas em `task.complete` (ex.: “Ready to work?”, “Something need doing?”), que podem soar como início de tarefa; para falas de conclusão mais claras, use `sc_scv` (“Job's finished”) ou `glados` (“Good news”). Isso é conteúdo do pack, não mapeamento do plugin.
 
 Se o PeonPing estiver em outro caminho, ajuste `packsDir`. Para pacotes OpenPeon soltos, o default `~/.openpeon/packs/` funciona sem configuração.
 
@@ -107,17 +112,14 @@ O formato CESP 1.0 usado pelos packs reais é:
 ```json
 {
   "cesp_version": "1.0",
-  "name": "peon",
+  "name": "my-pack",
+  "display_name": "My Sound Pack",
+  "version": "1.0.0",
   "categories": {
     "task.complete": {
       "sounds": [
-        { "file": "sounds/PeonReady1.wav", "label": "Ready to work?" },
-        { "file": "sounds/PeonWhat4.wav", "label": "Something need doing?" }
-      ]
-    },
-    "task.error": {
-      "sounds": [
-        { "file": "sounds/PeonDeath.wav", "label": "Death" }
+        { "file": "sounds/complete.wav", "label": "Done" },
+        { "file": "sounds/finished.mp3", "label": "Finished" }
       ]
     }
   }
@@ -140,7 +142,8 @@ Regras de caminho:
 
 - `file` é relativo ao manifesto e usa barras normais (`/`).
 - Se `file` não contiver `/`, o plugin prefixa `sounds/`.
-- Arquivos inexistentes são descartados no load com um aviso.
+- Caminhos absolutos, `../` e caminhos que saem do pack são rejeitados.
+- Nomes de arquivo devem casar com `[a-zA-Z0-9._-]+`.
 
 `category_aliases` é opcional:
 
@@ -152,6 +155,19 @@ Regras de caminho:
 }
 ```
 
+## Conformidade CESP 1.0
+
+O player valida, no load:
+
+- `cesp_version` 1.x (um major diferente desativa o pack);
+- `categories` como objeto e cada categoria como `{ "sounds": [...] }` (a variante legada em array também é aceita);
+- caminhos relativos, sem `../`, sem barras invertidas e dentro da raiz do pack;
+- extensões `.wav`, `.mp3` e `.ogg`, conferindo os magic bytes (`RIFF/WAVE`, `ID3`/frame MP3, `OggS`);
+- limite de 1 MB por arquivo e aviso se o total passar de 50 MB;
+- `label` presente (aviso quando ausente).
+
+Categorias core suportadas: `session.start`, `task.acknowledge`, `task.complete`, `task.error`, `input.required` e `resource.limit`. As categorias estendidas `user.spam`, `session.end` e `task.progress` são opcionais na spec e não estão mapeadas.
+
 ## Mapeamento de eventos
 
 O catálogo do Cordis não expõe `session/start`, `turn/start`, `turn/end` nem `tool/call` como eventos Cordis. Os eventos de turno são variantes duráveis de `session/event`; “aguardando input” é representado pelos eventos explícitos de aprovação e pergunta.
@@ -159,13 +175,19 @@ O catálogo do Cordis não expõe `session/start`, `turn/start`, `turn/end` nem 
 | Evento real do Harness | Categoria CESP | Observação |
 |---|---|---|
 | `agent/created` | `session.start` | Equivalente mais próximo de `session/start`. |
-| `session/event` com `event.type === 'turn/start'` | `task.acknowledge` | Opcional; desligue em `enabledCategories` se incomodar. |
-| `session/event` com `event.type === 'turn/end'` e `reason.kind === 'completed'` | `task.complete` | Só conclusão limpa. |
-| `agent/error` | `task.error` | Erros de step/turn. |
-| `approval/request` | `input.required` | Waterfall: o listener chama `next()` para não vetar a aprovação. |
-| `user-questions/request` | `input.required` | Waterfall: idem; cobre perguntas ao usuário. |
+| `session/event` com `event.type === 'turn/start'` | `task.acknowledge` | Habilitada por padrão; pode ser desligada em `enabledCategories`. |
+| `session/event` com `event.type === 'turn/end'` e `reason.kind === 'completed'` | `task.complete` | Conclusão limpa. |
+| `session/event` com `event.type === 'turn/end'` e `reason.kind === 'max-tokens'` | `resource.limit` | Limite de tokens/contexto. |
+| `session/event` com `event.type === 'approval/asked'` | `input.required` | Caminho durável; sempre chega ao plugin. |
+| `session/event` com `event.type === 'tool/call'` e `name === 'ask_user_question'` | `input.required` | Caminho durável para perguntas ao usuário. |
+| `agent/error` com `RATE_LIMIT`, `QUOTA`, `ACCOUNT_QUOTA` ou `CONTEXT_WINDOW_EXCEEDED` | `resource.limit` | Limite de recurso, não falha genérica. |
+| `agent/error` (demais erros) | `task.error` | Erros de step/turn. |
+| `approval/request` | `input.required` | Waterfall; reforço quando o escopo o entrega à raiz. |
+| `user-questions/request` | `input.required` | Waterfall; reforço quando o escopo o entrega à raiz. |
 
-`turn/end` com `aborted`, `blocked`, `max-tokens`, `interrupted` ou `forked` não toca som. Ouvir `tool/call` diretamente não permitiria saber se a próxima etapa depende de aprovação; por isso foi usado `approval/request`.
+`turn/end` com `aborted`, `blocked`, `interrupted` ou `forked` não toca som. `turn/end` com `error` deixa `agent/error` tocar `task.error`/`resource.limit`, evitando som duplicado.
+
+**Escopo dos eventos:** `approval/request` e `user-questions/request` são waterfalls despachados no escopo do agente e podem não chegar a um plugin montado na raiz. Por isso o caminho principal de `input.required` são os eventos duráveis `approval/asked` e `tool/call`; os waterfalls ficam como reforço, registrados com `{ global: true }` e repassando `next()`.
 
 ## Backends de áudio
 
@@ -188,7 +210,7 @@ pnpm build
 pnpm test
 ```
 
-A suíte cobre manifesto, aliases, debounce, no-repeat, mute, categorias desabilitadas, paths `sounds/`, formato CESP 1.0, variante em array e a integração com um `Context` real do Cordis. Também há um teste ponta a ponta manual com um pack real do PeonPing e `pw-play`.
+A suíte cobre manifesto, aliases, debounce, no-repeat, mute, categorias desabilitadas, paths `sounds/`, formato CESP 1.0, variante em array, path traversal, magic bytes, limites de tamanho, mapeamento de `resource.limit` e a integração com um `Context` real do Cordis. Também há um teste ponta a ponta manual com um pack real do PeonPing e `pw-play`.
 
 ## Solução de problemas
 
@@ -207,8 +229,13 @@ Depois desligue/ligue o plugin em **Plugins**.
 
 1. Confira `packsDir` e `activePack`.
 2. Teste o arquivo direto: `pw-play ~/.claude/hooks/peon-ping/packs/peon/sounds/PeonReady1.wav`.
-3. Confira se o pack aparece no log do plugin (`[cesp-player] pacote "peon" carregado...`).
+3. Confira se o pack aparece no log do plugin (`[cesp-player] pacote "..." carregado...`).
 4. Desligue/ligue o plugin depois de adicionar arquivos.
+
+**Som de “iniciar tarefa” aparece no fim**
+
+- Verifique se `task.acknowledge` não está desabilitada.
+- O pack `peon` usa falas genéricas em `task.complete` (“Ready to work?”). Troque para `sc_scv` ou `glados` se quiser uma fala de conclusão explícita. Isso é conteúdo do pack, não mapeamento do plugin.
 
 **`aplay` não respeita o volume**
 
@@ -219,6 +246,7 @@ Depois desligue/ligue o plugin em **Plugins**.
 - Apenas Linux (depende de `which` e dos players acima).
 - O manifesto é lido no load; trocar `activePack`/`packsDir` ou adicionar arquivos exige recarregar o plugin.
 - Sessões de subagentes também emitem os eventos; o plugin não as filtra.
+- Categorias estendidas (`user.spam`, `session.end`, `task.progress`) não estão mapeadas; são opcionais na CESP 1.0.
 - Se nenhum backend existir no `PATH`, os sons ficam desativados com um aviso único no console.
 
 ## Licença

@@ -12,11 +12,18 @@
  * relógio/fonte de aleatoriedade injetáveis, o que o torna testável e mantém a
  * integração com eventos em `index.ts`.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path';
 /** Debounce exigido pela especificação CESP. */
 export const DEFAULT_DEBOUNCE_MS = 500;
+/** Limites da CESP 1.0 (Seção 4.2). */
+const MAX_AUDIO_BYTES = 1024 * 1024;
+const MAX_PACK_BYTES = 50 * 1024 * 1024;
+/** Formatos que a CESP 1.0 exige suporte (Seção 4.1). */
+const AUDIO_EXTENSIONS = new Set(['.wav', '.mp3', '.ogg']);
+/** Seção 4.3: nomes de arquivo sem espaços/Unicode. */
+const SAFE_FILE_NAME = /^[a-zA-Z0-9._-]+$/;
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);
 }
@@ -46,6 +53,41 @@ function extractSoundEntries(value) {
     if (record !== null && Array.isArray(record.sounds))
         return record.sounds;
     return null;
+}
+/**
+ * Resolve o caminho do som garantindo a Seção 3.1:
+ * relativo ao manifesto, sem `../`, sem caminho absoluto e sem sair do pack.
+ */
+function resolveSoundPath(packDir, file) {
+    if (isAbsolute(file) || file.includes('\\'))
+        return null;
+    if (file.split('/').includes('..'))
+        return null;
+    const relative = file.includes('/') ? file : `sounds/${file}`;
+    const absolute = resolve(packDir, relative);
+    const root = packDir.endsWith(sep) ? packDir : `${packDir}${sep}`;
+    if (!absolute.startsWith(root))
+        return null;
+    return absolute;
+}
+/** Seção 4.4 / Appendix C: valida os magic bytes do formato declarado. */
+function matchesAudioMagic(extension, header) {
+    if (extension === '.wav') {
+        return (header.length >= 12 &&
+            header.toString('ascii', 0, 4) === 'RIFF' &&
+            header.toString('ascii', 8, 12) === 'WAVE');
+    }
+    if (extension === '.ogg') {
+        return header.length >= 4 && header.toString('ascii', 0, 4) === 'OggS';
+    }
+    if (extension === '.mp3') {
+        if (header.length >= 3 && header.toString('ascii', 0, 3) === 'ID3')
+            return true;
+        return (header.length >= 2 &&
+            header[0] === 0xff &&
+            (header[1] === 0xfb || header[1] === 0xf3 || header[1] === 0xf2));
+    }
+    return false;
 }
 export class CespPlayer {
     packsDir;
@@ -167,13 +209,28 @@ export class CespPlayer {
             this.disable(`manifesto ${manifestPath} não contém um objeto JSON`);
             return;
         }
+        // Seção 2.1/9: o pack declara a versão da spec; este player implementa 1.x.
+        const cespVersion = typeof record.cesp_version === 'string' ? record.cesp_version.trim() : '';
+        if (cespVersion.length === 0) {
+            this.logger.warn('[cesp-player] manifesto sem "cesp_version"; assumindo compatibilidade com CESP 1.x.');
+        }
+        else if (!/^1(?:\.|$)/.test(cespVersion)) {
+            this.disable(`CESP ${cespVersion} incompatível; este player implementa CESP 1.x`);
+            return;
+        }
+        for (const field of ['name', 'display_name', 'version']) {
+            const value = record[field];
+            if (typeof value !== 'string' || value.trim().length === 0) {
+                this.logger.warn(`[cesp-player] manifesto sem campo obrigatório "${field}".`);
+            }
+        }
         const categoriesRaw = asRecord(record.categories);
         if (categoriesRaw === null) {
             this.disable(`manifesto ${manifestPath} não tem um objeto "categories" válido`);
             return;
         }
         const categories = new Map();
-        const missingSounds = [];
+        const stats = { missingSounds: [], totalBytes: 0 };
         let soundCount = 0;
         for (const [category, value] of Object.entries(categoriesRaw)) {
             const entries = extractSoundEntries(value);
@@ -183,7 +240,7 @@ export class CespPlayer {
             }
             const sounds = [];
             for (const entry of entries) {
-                const sound = this.parseSound(entry, packDir, missingSounds);
+                const sound = this.parseSound(entry, packDir, stats);
                 if (sound !== null)
                     sounds.push(sound);
             }
@@ -192,10 +249,14 @@ export class CespPlayer {
                 soundCount += sounds.length;
             }
         }
-        if (missingSounds.length > 0) {
-            const preview = missingSounds.slice(0, 5).join(', ');
-            const suffix = missingSounds.length > 5 ? ` (+${missingSounds.length - 5})` : '';
-            this.logger.warn(`[cesp-player] ${missingSounds.length} arquivo(s) de som não encontrado(s): ${preview}${suffix}`);
+        if (stats.missingSounds.length > 0) {
+            const preview = stats.missingSounds.slice(0, 5).join(', ');
+            const suffix = stats.missingSounds.length > 5 ? ` (+${stats.missingSounds.length - 5})` : '';
+            this.logger.warn(`[cesp-player] ${stats.missingSounds.length} arquivo(s) de som não encontrado(s): ${preview}${suffix}`);
+        }
+        if (stats.totalBytes > MAX_PACK_BYTES) {
+            this.logger.warn(`[cesp-player] pacote com ${(stats.totalBytes / (1024 * 1024)).toFixed(1)} MB ` +
+                `excede o limite de 50 MB da CESP; considere reduzir os arquivos.`);
         }
         if (categories.size === 0) {
             this.disable(`nenhuma categoria com som válido em ${manifestPath}`);
@@ -219,7 +280,7 @@ export class CespPlayer {
         this.logger.info?.(`[cesp-player] pacote "${activePack}" carregado de ${packDir} ` +
             `(${categories.size} categorias, ${soundCount} sons).`);
     }
-    parseSound(entry, packDir, missingSounds) {
+    parseSound(entry, packDir, stats) {
         const record = asRecord(entry);
         if (record === null) {
             this.logger.warn('[cesp-player] entrada de som ignorada: esperado um objeto { file, label }.');
@@ -230,9 +291,12 @@ export class CespPlayer {
             this.logger.warn('[cesp-player] entrada de som ignorada: campo "file" ausente ou vazio.');
             return null;
         }
-        // Regra CESP: caminho relativo ao manifesto; sem "/" ganha prefixo sounds/.
-        const relative = file.includes('/') ? file : `sounds/${file}`;
-        const absolute = resolve(packDir, relative);
+        const absolute = resolveSoundPath(packDir, file);
+        if (absolute === null) {
+            this.logger.warn(`[cesp-player] caminho de som inválido "${file}": ` +
+                'a CESP exige caminho relativo, com barras normais, sem ".." e dentro do pack.');
+            return null;
+        }
         let exists = false;
         try {
             exists = existsSync(absolute);
@@ -242,11 +306,68 @@ export class CespPlayer {
             return null;
         }
         if (!exists) {
-            missingSounds.push(absolute);
+            stats.missingSounds.push(absolute);
             return null;
         }
-        const label = typeof record.label === 'string' ? record.label : undefined;
+        const size = this.validateAudioFile(absolute);
+        if (size === null)
+            return null;
+        stats.totalBytes += size;
+        const label = typeof record.label === 'string' && record.label.trim().length > 0
+            ? record.label.trim()
+            : undefined;
+        if (label === undefined) {
+            this.logger.warn(`[cesp-player] som "${file}" sem "label"; a CESP 1.0 exige label para acessibilidade.`);
+        }
         return label === undefined ? { file: absolute } : { file: absolute, label };
+    }
+    /**
+     * Valida formato/tamanho/magic bytes do arquivo (CESP 1.0, Seções 4.1–4.4).
+     * Retorna o tamanho em bytes quando o arquivo é aceitável.
+     */
+    validateAudioFile(file) {
+        const name = basename(file);
+        if (!SAFE_FILE_NAME.test(name)) {
+            this.logger.warn(`[cesp-player] som "${name}" ignorado: o nome deve casar com [a-zA-Z0-9._-]+.`);
+            return null;
+        }
+        const extension = extname(file).toLowerCase();
+        if (!AUDIO_EXTENSIONS.has(extension)) {
+            this.logger.warn(`[cesp-player] som "${name}" ignorado: formato "${extension || '(sem extensão)'}" ` +
+                'não é WAV, MP3 nem OGG.');
+            return null;
+        }
+        let size;
+        try {
+            const stat = statSync(file);
+            if (!stat.isFile()) {
+                this.logger.warn(`[cesp-player] som "${name}" ignorado: não é um arquivo regular.`);
+                return null;
+            }
+            size = stat.size;
+        }
+        catch (error) {
+            this.logger.warn(`[cesp-player] falha ao ler ${file}: ${describeError(error)}`);
+            return null;
+        }
+        if (size > MAX_AUDIO_BYTES) {
+            this.logger.warn(`[cesp-player] som "${name}" ignorado: ${(size / (1024 * 1024)).toFixed(1)} MB ` +
+                'excede o limite de 1 MB da CESP.');
+            return null;
+        }
+        let header;
+        try {
+            header = readFileSync(file).subarray(0, 12);
+        }
+        catch (error) {
+            this.logger.warn(`[cesp-player] falha ao validar ${file}: ${describeError(error)}`);
+            return null;
+        }
+        if (!matchesAudioMagic(extension, header)) {
+            this.logger.warn(`[cesp-player] som "${name}" ignorado: os magic bytes não correspondem a ${extension}.`);
+            return null;
+        }
+        return size;
     }
     resolveCategory(requested) {
         const manifest = this.manifest;

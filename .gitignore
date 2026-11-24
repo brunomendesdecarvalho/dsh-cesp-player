@@ -2,5 +2,6 @@ node_modules/
 .runtime/
 .consumer/
 .pnpm-store/
+.gh-cache/
 *.tgz
 *.log

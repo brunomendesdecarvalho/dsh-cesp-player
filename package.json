@@ -50,7 +50,6 @@
   "engines": {
     "node": ">=20"
   },
-  "packageManager": "pnpm@12.18.0",
   "dependencies": {
     "@deepseek-ai/schemastery": "~3.19.0"
   },

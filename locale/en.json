@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CESP sound player",
+    "description": "Plays OpenPeon CESP sound cues for session start, turn completion, errors, and approval or question prompts."
+  }
+}

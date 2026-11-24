@@ -1,0 +1,5 @@
+# Patch instalado pelo Plugin Manager. Os defaults do schema preenchem
+# packsDir, activePack, volume, mute e enabledCategories.
+- insert:
+    - id: cesp-player
+      name: '@local/cesp-player'

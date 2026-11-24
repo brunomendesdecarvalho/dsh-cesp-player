@@ -1,0 +1,67 @@
+{
+  "name": "@local/cesp-player",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Plays OpenPeon CESP sound cues for DeepSeek Harness lifecycle events on Linux.",
+  "license": "MIT",
+  "author": "Bruno Mendes de Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brunomendesdecarvalho/dsh-cesp-player.git"
+  },
+  "homepage": "https://github.com/brunomendesdecarvalho/dsh-cesp-player#readme",
+  "bugs": {
+    "url": "https://github.com/brunomendesdecarvalho/dsh-cesp-player/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "cesp",
+    "openpeon",
+    "sound",
+    "linux"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "icon.svg"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@12.18.0",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "~5.9.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
